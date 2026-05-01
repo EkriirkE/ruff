@@ -24,7 +24,8 @@ use crate::types::constraints::{
 };
 use crate::types::cyclic::ActiveRecursionDetector;
 use crate::types::generics::{
-    ApplySpecialization, GenericContext, InferableTypeVars, Specialization, walk_generic_context,
+    ApplySpecialization, GenericContext, InferableTypeVars, Specialization, SpecializationBuilder,
+    walk_generic_context,
 };
 use crate::types::infer::{TypeExpressionFlags, infer_deferred_types};
 use crate::types::relation::{
@@ -900,24 +901,32 @@ impl<'db> Signature<'db> {
         }
     }
 
-    /// Returns `true` if this signature's first parameter can accept the bound `self` type.
+    /// Returns the signature exposed after binding it to `self_type`.
     ///
-    /// This is used to prune impossible overloads when a method is bound to a concrete receiver.
-    /// If a signature has no positional first parameter, we conservatively keep it.
-    pub(crate) fn can_bind_self_to(&self, db: &'db dyn Db, self_type: Type<'db>) -> bool {
+    /// This is used to prune impossible overloads when a method is bound to a concrete receiver. If
+    /// the receiver annotation contains inferable method type variables, we infer those from the
+    /// receiver and apply the specialization before removing the receiver parameter. That avoids
+    /// exposing broad, still-generic overloads for dependency-stub patterns like NumPy's
+    /// `ndarray.__add__`.
+    pub(crate) fn bind_self_to(
+        &self,
+        db: &'db dyn Db,
+        self_type: Type<'db>,
+        typing_self_type: Type<'db>,
+    ) -> Option<Self> {
         // A dynamic receiver might be compatible with any explicit receiver annotation.
         if self_type.is_dynamic() {
-            return true;
+            return Some(self.bind_self(db, Some(typing_self_type)));
         }
 
         // Without a first parameter, there is no receiver annotation to check.
         let Some(first_parameter) = self.parameters.get(0) else {
-            return true;
+            return Some(self.bind_self(db, Some(typing_self_type)));
         };
 
         // If there is no positional receiver, this signature cannot be pruned based on `self`.
         if !first_parameter.is_positional() {
-            return true;
+            return Some(self.bind_self(db, Some(typing_self_type)));
         }
 
         let mut expected_self_ty = first_parameter.annotated_type();
@@ -927,7 +936,7 @@ impl<'db> Signature<'db> {
         // Avoid the more expensive normalization below for receiver annotations that already
         // accept all values, or already exactly match the bound receiver.
         if accepts_any_or_exact_self(expected_self_ty) {
-            return true;
+            return Some(self.bind_self(db, Some(typing_self_type)));
         }
 
         // TODO: Expand type aliases here so `type Alias = Self` in a class body
@@ -936,7 +945,7 @@ impl<'db> Signature<'db> {
 
         // `Self` binding can make the receiver annotation trivially compatible.
         if accepts_any_or_exact_self(expected_self_ty) {
-            return true;
+            return Some(self.bind_self(db, Some(typing_self_type)));
         }
 
         // A specialized receiver can make generic receiver annotations concrete enough to compare.
@@ -946,19 +955,30 @@ impl<'db> Signature<'db> {
 
             // Specialization can also make the receiver annotation trivially compatible.
             if accepts_any_or_exact_self(expected_self_ty) {
-                return true;
+                return Some(self.bind_self(db, Some(typing_self_type)));
             }
         }
 
         let inferable_typevars = self.inferable_typevars(db);
-        if inferable_typevars == InferableTypeVars::None {
+        if inferable_typevars == InferableTypeVars::None || !expected_self_ty.has_typevar(db) {
             let when = self_type.when_constraint_set_assignable_to_owned(db, expected_self_ty);
-            when.query(|_, when| when.is_always_satisfied(db))
+            if when.query(|_, when| when.is_always_satisfied(db)) {
+                Some(self.bind_self(db, Some(typing_self_type)))
+            } else {
+                None
+            }
         } else {
+            let Some(generic_context) = self.generic_context else {
+                return Some(self.bind_self(db, Some(typing_self_type)));
+            };
             let constraints = ConstraintSetBuilder::new();
-            self_type
-                .when_assignable_to(db, expected_self_ty, &constraints, inferable_typevars)
-                .is_always_satisfied(db)
+            let mut builder = SpecializationBuilder::new(db, &constraints, inferable_typevars);
+            builder.infer(expected_self_ty, self_type).ok()?;
+            let specialization = builder.build_with(generic_context, |_, _| None);
+            Some(
+                self.apply_specialization(db, specialization)
+                    .bind_self(db, Some(typing_self_type)),
+            )
         }
     }
 
@@ -1315,8 +1335,8 @@ impl<'c, 'db> TypeRelationChecker<'_, 'c, 'db> {
 
         let is_unary_overload_aggregate_candidate_type = |ty: Type<'db>| {
             // Keep aggregate probing away from inference-sensitive shapes and defer them to the
-            // legacy path, which already handles dynamic/typevar interactions.
-            !ty.has_dynamic(db) && !ty.has_typevar_or_typevar_instance(db)
+            // legacy path, which already handles typevar interactions.
+            !ty.has_typevar_or_typevar_instance(db)
         };
 
         let other_parameter_type = single_required_positional_parameter_type(target_signature)?;

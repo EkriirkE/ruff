@@ -219,6 +219,16 @@ class Reader(Generic[T_co]):
 
 def union_receiver(reader: Reader[int | str]):
     reveal_type(reader.get)  # revealed: Overload[]
+
+class ReceiverGeneric[T]:
+    @overload
+    def method[S](self: "ReceiverGeneric[S]", value: S) -> S: ...
+    @overload
+    def method(self, value: bytes) -> bytes: ...
+    def method(self, value: object) -> object:
+        return value
+
+reveal_type(ReceiverGeneric[str]().method)  # revealed: Overload[(value: str) -> str, (value: bytes) -> bytes]
 ```
 
 ## Constructor
