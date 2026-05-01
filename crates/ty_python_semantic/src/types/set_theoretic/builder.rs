@@ -129,6 +129,52 @@ fn merge_truthiness_guarded_pair<'db>(
     }
 }
 
+fn normalize_enum_complement_unions<'db>(db: &'db dyn Db, types: &mut Vec<Type<'db>>) -> bool {
+    for complement_index in 0..types.len() {
+        let Some((enum_class, excluded_names)) =
+            types[complement_index].enum_complement_excluded_member_names(db)
+        else {
+            continue;
+        };
+        let Some(metadata) = enum_metadata(db, enum_class) else {
+            continue;
+        };
+
+        let mut excluded_indices = Vec::with_capacity(excluded_names.len());
+        let mut found_names = FxHashSet::default();
+        for (index, ty) in types.iter().enumerate() {
+            if index == complement_index {
+                continue;
+            }
+
+            let Some(enum_literal) = ty.as_enum_literal() else {
+                continue;
+            };
+            if enum_literal.enum_class(db) != enum_class {
+                continue;
+            }
+
+            let Some(canonical_name) = metadata.resolve_member(enum_literal.name(db)) else {
+                continue;
+            };
+            if excluded_names.contains(canonical_name) && found_names.insert(canonical_name.clone())
+            {
+                excluded_indices.push(index);
+            }
+        }
+
+        if found_names.len() == excluded_names.len() {
+            types[complement_index] = enum_class.to_non_generic_instance(db);
+            for index in excluded_indices.into_iter().rev() {
+                types.swap_remove(index);
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiteralKind<'db> {
     Int,
@@ -889,6 +935,11 @@ impl<'db> UnionBuilder<'db> {
     }
 
     pub(crate) fn try_build(self) -> Option<Type<'db>> {
+        let db = self.db;
+        let unpack_aliases = self.unpack_aliases;
+        let cycle_recovery = self.cycle_recovery;
+        let recursively_defined = self.recursively_defined;
+
         let type_count = self.elements.iter().map(UnionElement::type_count).sum();
         let mut types = Vec::with_capacity(type_count);
         for element in self.elements {
@@ -897,7 +948,7 @@ impl<'db> UnionBuilder<'db> {
                     types.extend(literals.into_iter().map(|(literal, promotable)| {
                         Type::from(
                             LiteralValueType::new(literal, promotable)
-                                .with_recursively_defined(self.recursively_defined),
+                                .with_recursively_defined(recursively_defined),
                         )
                     }));
                 }
@@ -905,7 +956,7 @@ impl<'db> UnionBuilder<'db> {
                     types.extend(literals.into_iter().map(|(literal, promotable)| {
                         Type::from(
                             LiteralValueType::new(literal, promotable)
-                                .with_recursively_defined(self.recursively_defined),
+                                .with_recursively_defined(recursively_defined),
                         )
                     }));
                 }
@@ -913,7 +964,7 @@ impl<'db> UnionBuilder<'db> {
                     types.extend(literals.into_iter().map(|(literal, promotable)| {
                         Type::from(
                             LiteralValueType::new(literal, promotable)
-                                .with_recursively_defined(self.recursively_defined),
+                                .with_recursively_defined(recursively_defined),
                         )
                     }));
                 }
@@ -921,20 +972,32 @@ impl<'db> UnionBuilder<'db> {
                     types.extend(literals.into_iter().map(|(literal, promotable)| {
                         Type::from(
                             LiteralValueType::new(literal, promotable)
-                                .with_recursively_defined(self.recursively_defined),
+                                .with_recursively_defined(recursively_defined),
                         )
                     }));
                 }
                 UnionElement::Type(ty) => types.push(ty),
             }
         }
+
+        if normalize_enum_complement_unions(db, &mut types) {
+            let builder = UnionBuilder::new(db)
+                .unpack_aliases(unpack_aliases)
+                .cycle_recovery(cycle_recovery)
+                .recursively_defined(recursively_defined);
+            return types
+                .into_iter()
+                .fold(builder, UnionBuilder::add)
+                .try_build();
+        }
+
         match types.len() {
             0 => None,
             1 => Some(types[0]),
             _ => Some(Type::Union(UnionType::new(
-                self.db,
+                db,
                 types.into_boxed_slice(),
-                self.recursively_defined,
+                recursively_defined,
             ))),
         }
     }

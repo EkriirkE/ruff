@@ -1096,6 +1096,19 @@ impl<'db> Type<'db> {
         )
     }
 
+    pub(crate) fn enum_complement_excluded_member_names(
+        self,
+        db: &'db dyn Db,
+    ) -> Option<(ClassLiteral<'db>, FxHashSet<Name>)> {
+        let (enum_class, _, excluded_names) = self.enum_complement(db)?;
+
+        if excluded_names.is_empty() {
+            return None;
+        }
+
+        Some((enum_class, excluded_names))
+    }
+
     pub(crate) fn enum_complement_member_type(
         self,
         db: &'db dyn Db,
@@ -1130,20 +1143,6 @@ impl<'db> Type<'db> {
         }
 
         found_member.then(|| builder.build())
-    }
-
-    pub(crate) fn enum_complement_single_literal_type(self, db: &'db dyn Db) -> Option<Type<'db>> {
-        let (enum_class, metadata, excluded_names) = self.enum_complement(db)?;
-
-        if metadata.members.len().checked_sub(excluded_names.len())? != 1 {
-            return None;
-        }
-
-        metadata
-            .members
-            .keys()
-            .find(|name| !excluded_names.contains(*name))
-            .map(|name| Type::enum_literal(EnumLiteralType::new(db, enum_class, name.clone())))
     }
 
     fn is_enum(&self, db: &'db dyn Db) -> bool {
