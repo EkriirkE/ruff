@@ -11,7 +11,9 @@ use crate::types::diagnostic::{
 use crate::types::enums::is_enum_class_by_inheritance;
 use crate::types::infer::builder::TypeInferenceBuilder;
 use crate::types::mro::{DynamicMroError, DynamicMroErrorKind};
-use crate::types::{ClassBase, KnownClass, Type, extract_fixed_length_iterable_element_types};
+use crate::types::{
+    ClassBase, KnownClass, KnownInstanceType, Type, extract_fixed_length_iterable_element_types,
+};
 
 /// Whether a dynamic class-like value is being created via `type()`, `types.new_class()`,
 /// or `make_dataclass()`.
@@ -19,8 +21,8 @@ use crate::types::{ClassBase, KnownClass, Type, extract_fixed_length_iterable_el
 /// This is used to adjust validation rules and diagnostic messages for dynamic class
 /// creation. For example, `types.new_class()` properly handles metaclasses and
 /// `__mro_entries__`, so enum-specific restrictions only apply to `type()` and
-/// `make_dataclass()`, while `Generic` and `TypedDict` bases are rejected for all
-/// three entry points.
+/// `make_dataclass()`. `Generic` and `TypedDict` bases are rejected for dynamic
+/// classes except for `make_dataclass()` with a subscripted `Generic[...]` base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DynamicClassKind {
     TypeCall,
@@ -155,6 +157,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             };
 
             match class_base {
+                ClassBase::Generic
+                    if kind == DynamicClassKind::MakeDataclass
+                        && matches!(
+                            base,
+                            Type::KnownInstance(KnownInstanceType::SubscriptedGeneric(_))
+                        ) => {}
                 ClassBase::Generic | ClassBase::TypedDict => {
                     if let Some(builder) = self.context.report_lint(&INVALID_BASE, diagnostic_node)
                     {

@@ -407,11 +407,16 @@ pub(super) fn dynamic_metaclass_from_bases<'db>(
         return Ok(KnownClass::Type.to_class_literal(db));
     };
 
-    let mut candidate = candidate_base.metaclass(db);
+    let base_metaclass = |base: &ClassBase<'db>| match base {
+        ClassBase::Generic => KnownClass::Type.to_class_literal(db),
+        _ => base.metaclass(db),
+    };
+
+    let mut candidate = base_metaclass(candidate_base);
     let mut candidate_base = candidate_base;
 
     for base in rest {
-        let base_metaclass = base.metaclass(db);
+        let base_metaclass = base_metaclass(base);
 
         let Some(candidate_class) = candidate.to_class_type(db) else {
             continue;
@@ -561,6 +566,8 @@ impl<'db> DynamicDataclassLiteral<'db> {
                     else {
                         continue;
                     };
+                    let kw_only_default =
+                        static_class.has_dataclass_param(db, field_policy, DataclassFlags::KW_ONLY);
 
                     for (field_name, field) in
                         static_class.own_fields(db, specialization, field_policy)
@@ -591,7 +598,7 @@ impl<'db> DynamicDataclassLiteral<'db> {
                                 ty: field.declared_ty,
                                 default_ty: *default_ty,
                                 init: *init,
-                                kw_only: kw_only.unwrap_or(false),
+                                kw_only: kw_only.unwrap_or(kw_only_default),
                                 converter: *converter,
                             },
                         );
@@ -703,6 +710,10 @@ impl<'db> DynamicDataclassLiteral<'db> {
         };
 
         if !self.has_known_fields(db) && result.place.is_undefined() {
+            let flags = self.dataclass_params(db).flags(db);
+            if name == "__new__" || (name == "__init__" && !flags.contains(DataclassFlags::INIT)) {
+                return result;
+            }
             return Place::bound(Type::any()).into();
         }
 
@@ -778,9 +789,15 @@ impl<'db> DynamicDataclassLiteral<'db> {
 
         if !self.has_known_fields(db) {
             match name {
-                "__new__" | "__init__" => {
-                    let signature = Signature::new(Parameters::gradual_form(), instance_ty);
+                "__init__" if flags.contains(DataclassFlags::INIT) => {
+                    let signature = Signature::new(Parameters::gradual_form(), Type::none(db));
                     return Some(Type::function_like_callable(db, signature));
+                }
+                "__slots__"
+                    if Program::get(db).python_version(db) >= PythonVersion::PY310
+                        && flags.contains(DataclassFlags::SLOTS) =>
+                {
+                    return Some(Type::homogeneous_tuple(db, KnownClass::Str.to_instance(db)));
                 }
                 _ => {}
             }
@@ -796,13 +813,36 @@ impl<'db> DynamicDataclassLiteral<'db> {
 
         let Some(fields) = self.fields_for_synthesis(db) else {
             match name {
-                "__new__" | "__init__" => {
-                    let signature = Signature::new(Parameters::gradual_form(), instance_ty);
+                "__init__" if flags.contains(DataclassFlags::INIT) => {
+                    let signature = Signature::new(Parameters::gradual_form(), Type::none(db));
                     return Some(Type::function_like_callable(db, signature));
+                }
+                "__slots__"
+                    if Program::get(db).python_version(db) >= PythonVersion::PY310
+                        && flags.contains(DataclassFlags::SLOTS) =>
+                {
+                    return Some(Type::homogeneous_tuple(db, KnownClass::Str.to_instance(db)));
                 }
                 _ => return None,
             }
         };
+
+        if name == "__slots__"
+            && Program::get(db).python_version(db) >= PythonVersion::PY310
+            && flags.contains(DataclassFlags::SLOTS)
+        {
+            let slots = self
+                .fields(db)
+                .iter()
+                .filter(|field| !field.init_only && !field.class_var)
+                .map(|field| Type::string_literal(db, &field.name))
+                .chain(
+                    (flags.contains(DataclassFlags::WEAKREF_SLOT)
+                        && flags.contains(DataclassFlags::SLOTS))
+                    .then(|| Type::string_literal(db, "__weakref__")),
+                );
+            return Some(Type::heterogeneous_tuple(db, slots));
+        }
 
         synthesize_dataclass_class_member(db, name, instance_ty, flags, fields.into_iter())
     }
